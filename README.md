@@ -316,6 +316,22 @@ tail -f whatsapp-bridge/logs/app.log
 - **WhatsApp Bridge**: ~100MB RAM
 - **Base de datos**: Variable según historial
 
+## 🔔 Webhook opcional para n8n
+
+El bridge puede notificar a n8n cuando recibe un mensaje, evitando que n8n tenga que consultar `list_messages` continuamente. La función queda desactivada si `N8N_WEBHOOK_URL` no está definida.
+
+Configura estas variables en el entorno del bridge:
+
+```env
+N8N_WEBHOOK_URL=https://n8n.example.com/webhook/whatsapp-incoming
+N8N_WEBHOOK_TOKEN=replace-with-a-long-secret
+N8N_WEBHOOK_QUEUE_SIZE=100
+N8N_WEBHOOK_TIMEOUT_SECONDS=10
+N8N_WEBHOOK_RETRIES=3
+```
+
+Solo los mensajes entrantes se envían por defecto. Cada solicitud incluye el encabezado `X-Idempotency-Key` con el ID de WhatsApp y un cuerpo JSON con `id`, `chat_jid`, `sender`, `timestamp`, `content`, `is_from_me`, `media_type` y `filename`. El bridge usa una cola limitada y reintentos para que un n8n temporalmente caído no bloquee la conexión con WhatsApp.
+
 ## 📄 Licencia
 
 MIT License - Copyright (c) 2025

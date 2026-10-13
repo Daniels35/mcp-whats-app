@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"math/rand"
 	"net/http"
@@ -66,6 +67,130 @@ var (
 	WHATSAPP_DB_NAME = getEnvOrDefault("WHATSAPP_DB_NAME", "whatsapp.db")
 	DEBUG_MODE = getEnvOrDefault("DEBUG", "false") == "true"
 )
+
+// WebhookMessage is the stable payload sent to n8n for each new WhatsApp message.
+type WebhookMessage struct {
+	ID        string    `json:"id"`
+	ChatJID   string    `json:"chat_jid"`
+	Sender    string    `json:"sender"`
+	Timestamp time.Time `json:"timestamp"`
+	Content   string    `json:"content"`
+	IsFromMe  bool      `json:"is_from_me"`
+	MediaType string    `json:"media_type,omitempty"`
+	Filename  string    `json:"filename,omitempty"`
+}
+
+// WebhookDispatcher delivers messages outside the WhatsApp event handler so a
+// slow or unavailable n8n instance cannot block the bridge.
+type WebhookDispatcher struct {
+	url        string
+	token      string
+	client     *http.Client
+	queue      chan WebhookMessage
+	retries    int
+	workerDone chan struct{}
+}
+
+func NewWebhookDispatcher() *WebhookDispatcher {
+	webhookURL := getEnvOrDefault("N8N_WEBHOOK_URL", "")
+	if webhookURL == "" {
+		return nil
+	}
+
+	queueSize := getEnvOrDefaultInt("N8N_WEBHOOK_QUEUE_SIZE", 100)
+	if queueSize < 1 {
+		queueSize = 1
+	}
+	retries := getEnvOrDefaultInt("N8N_WEBHOOK_RETRIES", 3)
+	if retries < 1 {
+		retries = 1
+	}
+	timeout := getEnvOrDefaultInt("N8N_WEBHOOK_TIMEOUT_SECONDS", 10)
+	if timeout < 1 {
+		timeout = 1
+	}
+
+	dispatcher := &WebhookDispatcher{
+		url:        webhookURL,
+		token:      getEnvOrDefault("N8N_WEBHOOK_TOKEN", ""),
+		client:     &http.Client{Timeout: time.Duration(timeout) * time.Second},
+		queue:      make(chan WebhookMessage, queueSize),
+		retries:    retries,
+		workerDone: make(chan struct{}),
+	}
+	go dispatcher.run()
+	fmt.Printf("n8n webhook enabled: %s (queue=%d, retries=%d)\n", dispatcher.url, queueSize, retries)
+	return dispatcher
+}
+
+func (d *WebhookDispatcher) run() {
+	defer close(d.workerDone)
+	for message := range d.queue {
+		if err := d.deliver(message); err != nil {
+			fmt.Printf("n8n webhook delivery failed for %s: %v\n", message.ID, err)
+		}
+	}
+}
+
+func (d *WebhookDispatcher) Enqueue(message WebhookMessage) {
+	if d == nil {
+		return
+	}
+	select {
+	case d.queue <- message:
+	default:
+		fmt.Printf("n8n webhook queue full; dropping message %s\n", message.ID)
+	}
+}
+
+func (d *WebhookDispatcher) deliver(message WebhookMessage) error {
+	body, err := json.Marshal(message)
+	if err != nil {
+		return fmt.Errorf("encode message: %w", err)
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= d.retries; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, d.url, bytes.NewReader(body))
+		if err != nil {
+			return fmt.Errorf("create request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Idempotency-Key", message.ID)
+		if d.token != "" {
+			req.Header.Set("Authorization", "Bearer "+d.token)
+		}
+
+		resp, err := d.client.Do(req)
+		if err == nil {
+			responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			resp.Body.Close()
+			if readErr == nil && resp.StatusCode >= 200 && resp.StatusCode < 300 {
+				return nil
+			}
+			if readErr != nil {
+				lastErr = readErr
+			} else {
+				lastErr = fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(responseBody))
+			}
+		} else {
+			lastErr = err
+		}
+
+		if attempt < d.retries {
+			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
+		}
+	}
+	return lastErr
+}
+
+func (d *WebhookDispatcher) Close() {
+	if d == nil {
+		return
+	}
+	close(d.queue)
+	<-d.workerDone
+}
 
 // Message represents a chat message for our client
 type Message struct {
@@ -453,7 +578,7 @@ func extractMediaInfo(msg *waProto.Message) (mediaType string, filename string, 
 }
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger, webhook *WebhookDispatcher) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
@@ -510,6 +635,20 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: [%s: %s] %s\n", timestamp, direction, sender, mediaType, filename, content)
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
+		}
+
+		// Only incoming messages are forwarded by default to avoid reply loops.
+		if !msg.Info.IsFromMe && webhook != nil {
+			webhook.Enqueue(WebhookMessage{
+				ID:        msg.Info.ID,
+				ChatJID:   chatJID,
+				Sender:    sender,
+				Timestamp: msg.Info.Timestamp,
+				Content:   content,
+				IsFromMe:  msg.Info.IsFromMe,
+				MediaType: mediaType,
+				Filename:  filename,
+			})
 		}
 	}
 }
@@ -876,13 +1015,15 @@ func main() {
 		return
 	}
 	defer messageStore.Close()
+	webhook := NewWebhookDispatcher()
+	defer webhook.Close()
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			handleMessage(client, messageStore, v, logger, webhook)
 
 		case *events.HistorySync:
 			// Process history sync events
