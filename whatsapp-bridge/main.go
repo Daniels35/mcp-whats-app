@@ -17,6 +17,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -91,6 +93,46 @@ type WebhookDispatcher struct {
 	workerDone chan struct{}
 }
 
+// StatusWebhookEvent is the minimal state notification sent to n8n. It never
+// contains message content, phone numbers, or credentials.
+type StatusWebhookEvent struct {
+	EventID   string    `json:"event_id"`
+	Event     string    `json:"event"`
+	Timestamp time.Time `json:"timestamp"`
+	Reason    string    `json:"reason,omitempty"`
+	Service   string    `json:"service"`
+}
+
+type statusWebhookDispatcher struct {
+	url        string
+	token      string
+	client     *http.Client
+	queue      chan StatusWebhookEvent
+	retries    int
+	workerDone chan struct{}
+}
+
+type connectionState string
+
+const (
+	connectionUnknown      connectionState = "unknown"
+	connectionPairing      connectionState = "pairing"
+	connectionConnected    connectionState = "connected"
+	connectionDisconnected connectionState = "disconnected"
+	connectionLoggedOut    connectionState = "logged_out"
+)
+
+// connectionMonitor emits only real state transitions. Pairing and startup
+// failures before authentication are intentionally silent to avoid false
+// outage alerts.
+type connectionMonitor struct {
+	dispatcher *statusWebhookDispatcher
+	mu         sync.Mutex
+	state      connectionState
+}
+
+var statusEventSequence atomic.Uint64
+
 func NewWebhookDispatcher() *WebhookDispatcher {
 	webhookURL := getEnvOrDefault("N8N_WEBHOOK_URL", "")
 	if webhookURL == "" {
@@ -148,20 +190,24 @@ func (d *WebhookDispatcher) deliver(message WebhookMessage) error {
 	if err != nil {
 		return fmt.Errorf("encode message: %w", err)
 	}
+	return postWebhookJSON(d.client, d.url, d.token, body, message.ID, d.retries)
+}
+
+func postWebhookJSON(client *http.Client, url, token string, body []byte, id string, retries int) error {
 
 	var lastErr error
-	for attempt := 1; attempt <= d.retries; attempt++ {
-		req, err := http.NewRequest(http.MethodPost, d.url, bytes.NewReader(body))
+	for attempt := 1; attempt <= retries; attempt++ {
+		req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
 			return fmt.Errorf("create request: %w", err)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Idempotency-Key", message.ID)
-		if d.token != "" {
-			req.Header.Set("Authorization", "Bearer "+d.token)
+		req.Header.Set("X-Idempotency-Key", id)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
 		}
 
-		resp, err := d.client.Do(req)
+		resp, err := client.Do(req)
 		if err == nil {
 			responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
 			resp.Body.Close()
@@ -177,12 +223,114 @@ func (d *WebhookDispatcher) deliver(message WebhookMessage) error {
 			lastErr = err
 		}
 
-		if attempt < d.retries {
+		if attempt < retries {
 			time.Sleep(time.Duration(1<<(attempt-1)) * time.Second)
 		}
 	}
 	return lastErr
 }
+
+func newStatusWebhookDispatcher() *statusWebhookDispatcher {
+	webhookURL := getEnvOrDefault("N8N_STATUS_WEBHOOK_URL", "")
+	if webhookURL == "" {
+		return nil
+	}
+	queueSize := getEnvOrDefaultInt("N8N_STATUS_WEBHOOK_QUEUE_SIZE", getEnvOrDefaultInt("N8N_WEBHOOK_QUEUE_SIZE", 100))
+	if queueSize < 1 {
+		queueSize = 1
+	}
+	retries := getEnvOrDefaultInt("N8N_STATUS_WEBHOOK_RETRIES", getEnvOrDefaultInt("N8N_WEBHOOK_RETRIES", 3))
+	if retries < 1 {
+		retries = 1
+	}
+	timeout := getEnvOrDefaultInt("N8N_STATUS_WEBHOOK_TIMEOUT_SECONDS", getEnvOrDefaultInt("N8N_WEBHOOK_TIMEOUT_SECONDS", 10))
+	if timeout < 1 {
+		timeout = 1
+	}
+	dispatcher := &statusWebhookDispatcher{
+		url:        webhookURL,
+		token:      getEnvOrDefault("N8N_STATUS_WEBHOOK_TOKEN", getEnvOrDefault("N8N_WEBHOOK_TOKEN", "")),
+		client:     &http.Client{Timeout: time.Duration(timeout) * time.Second},
+		queue:      make(chan StatusWebhookEvent, queueSize),
+		retries:    retries,
+		workerDone: make(chan struct{}),
+	}
+	go dispatcher.run()
+	fmt.Printf("n8n status webhook enabled: %s (queue=%d, retries=%d)\n", dispatcher.url, queueSize, retries)
+	return dispatcher
+}
+
+func (d *statusWebhookDispatcher) run() {
+	defer close(d.workerDone)
+	for event := range d.queue {
+		body, err := json.Marshal(event)
+		if err == nil {
+			err = postWebhookJSON(d.client, d.url, d.token, body, event.EventID, d.retries)
+		}
+		if err != nil {
+			fmt.Printf("n8n status webhook delivery failed for event %s: %v\n", event.EventID, err)
+		} else {
+			fmt.Printf("n8n status webhook delivered: event=%s state=%s\n", event.EventID, event.Event)
+		}
+	}
+}
+
+func (d *statusWebhookDispatcher) enqueue(event StatusWebhookEvent) {
+	if d == nil {
+		return
+	}
+	select {
+	case d.queue <- event:
+	default:
+		fmt.Printf("n8n status webhook queue full; dropping event %s\n", event.EventID)
+	}
+}
+
+func (d *statusWebhookDispatcher) close() {
+	if d == nil {
+		return
+	}
+	close(d.queue)
+	<-d.workerDone
+}
+
+func newConnectionMonitor(dispatcher *statusWebhookDispatcher) *connectionMonitor {
+	return &connectionMonitor{dispatcher: dispatcher, state: connectionUnknown}
+}
+
+func (m *connectionMonitor) transition(next connectionState, reason string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	previous := m.state
+	if previous == next || (previous == connectionUnknown && next != connectionConnected) || (previous == connectionPairing && next != connectionConnected) || (previous == connectionLoggedOut && next == connectionDisconnected) {
+		m.state = next
+		m.mu.Unlock()
+		return
+	}
+	m.state = next
+	m.mu.Unlock()
+
+	event := "connected"
+	if next != connectionConnected {
+		event = "disconnected"
+	}
+	sequence := statusEventSequence.Add(1)
+	m.dispatcher.enqueue(StatusWebhookEvent{
+		EventID:   fmt.Sprintf("whatsapp-status-%d-%d", time.Now().UnixNano(), sequence),
+		Event:     event,
+		Timestamp: time.Now().UTC(),
+		Reason:    reason,
+		Service:   "whatsapp-mcp",
+	})
+}
+
+func (m *connectionMonitor) connected(reason string) { m.transition(connectionConnected, reason) }
+
+func (m *connectionMonitor) disconnected(reason string) { m.transition(connectionDisconnected, reason) }
+
+func (m *connectionMonitor) loggedOut(reason string) { m.transition(connectionLoggedOut, reason) }
 
 func (d *WebhookDispatcher) Close() {
 	if d == nil {
@@ -1017,6 +1165,9 @@ func main() {
 	defer messageStore.Close()
 	webhook := NewWebhookDispatcher()
 	defer webhook.Close()
+	statusWebhook := newStatusWebhookDispatcher()
+	defer statusWebhook.close()
+	connectionMonitor := newConnectionMonitor(statusWebhook)
 
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
@@ -1031,9 +1182,19 @@ func main() {
 
 		case *events.Connected:
 			logger.Infof("Connected to WhatsApp")
+			connectionMonitor.connected("whatsapp_connected")
+
+		case *events.Disconnected:
+			logger.Warnf("Disconnected from WhatsApp; waiting for automatic reconnection")
+			connectionMonitor.disconnected("connection_lost")
 
 		case *events.LoggedOut:
 			logger.Warnf("Device logged out, please scan QR code to log in again")
+			connectionMonitor.loggedOut("logged_out")
+
+		case *events.StreamReplaced:
+			logger.Warnf("WhatsApp session was replaced by another connection")
+			connectionMonitor.disconnected("stream_replaced")
 		}
 	})
 

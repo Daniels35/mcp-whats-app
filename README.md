@@ -332,6 +332,38 @@ N8N_WEBHOOK_RETRIES=3
 
 Solo los mensajes entrantes se envían por defecto. Cada solicitud incluye el encabezado `X-Idempotency-Key` con el ID de WhatsApp y un cuerpo JSON con `id`, `chat_jid`, `sender`, `timestamp`, `content`, `is_from_me`, `media_type` y `filename`. El bridge usa una cola limitada y reintentos para que un n8n temporalmente caído no bloquee la conexión con WhatsApp.
 
+## 🔌 Webhook opcional para cambios de estado de WhatsApp
+
+El bridge también puede notificar a n8n cuando la sesión autenticada de WhatsApp pierde la conexión, se recupera o queda cerrada. Este webhook es independiente del webhook de mensajes y no debe conectarse a los flujos del asistente, cotizaciones o CRM.
+
+La notificación se genera desde los eventos de `whatsmeow` (`Connected`, `Disconnected`, `LoggedOut` y `StreamReplaced`). Los eventos se deduplican por transición de estado: una reconexión automática no produce una alerta nueva hasta que WhatsApp vuelva a emitir `Connected`. El pairing inicial y los fallos anteriores a una autenticación se mantienen silenciosos para evitar falsos avisos.
+
+Variables opcionales:
+
+```env
+N8N_STATUS_WEBHOOK_URL=https://n8n.example.com/webhook/whatsapp-status
+N8N_STATUS_WEBHOOK_TOKEN=replace-with-a-long-secret
+N8N_STATUS_WEBHOOK_QUEUE_SIZE=100
+N8N_STATUS_WEBHOOK_TIMEOUT_SECONDS=10
+N8N_STATUS_WEBHOOK_RETRIES=3
+```
+
+Si no se definen las variables específicas de tamaño, timeout o reintentos, se reutilizan los valores de `N8N_WEBHOOK_QUEUE_SIZE`, `N8N_WEBHOOK_TIMEOUT_SECONDS` y `N8N_WEBHOOK_RETRIES`. El token de estado usa `N8N_STATUS_WEBHOOK_TOKEN` y, si no existe, puede reutilizar `N8N_WEBHOOK_TOKEN`.
+
+El bridge envía el token únicamente en la cabecera `Authorization: Bearer <token>`. El cuerpo no contiene mensajes, números de terceros ni secretos:
+
+```json
+{
+  "event_id": "whatsapp-status-...",
+  "event": "disconnected",
+  "timestamp": "2026-10-18T12:00:00Z",
+  "reason": "connection_lost",
+  "service": "whatsapp-mcp"
+}
+```
+
+El envío se realiza mediante una cola asíncrona y limitada. Un n8n caído no bloquea la recepción ni la reconexión de WhatsApp; el bridge registra el error, aplica reintentos limitados y descarta eventos si la cola está llena. Este webhook no puede avisar si el contenedor o el VPS mueren por completo. Para ese caso se necesita posteriormente un monitor externo o una alerta del supervisor de Docker.
+
 ## 📄 Licencia
 
 MIT License - Copyright (c) 2025
