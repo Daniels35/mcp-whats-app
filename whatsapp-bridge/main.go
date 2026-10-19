@@ -395,6 +395,21 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 		fmt.Printf("DEBUG: Created JID - User: %s, Server: %s\n", recipientJID.User, recipientJID.Server)
 	}
 
+	// WhatsApp may identify an incoming direct chat with an LID instead of a
+	// phone-number JID. Resolve that LID through whatsmeow's local mapping before
+	// sending; passing the LID directly can fail with "no LID found".
+	if recipientJID.Server == types.HiddenUserServer {
+		pnJID, resolveErr := client.Store.LIDs.GetPNForLID(context.Background(), recipientJID.ToNonAD())
+		if resolveErr != nil {
+			return false, fmt.Sprintf("Error resolving WhatsApp LID %s: %v", recipientJID.String(), resolveErr)
+		}
+		if pnJID.User == "" || pnJID.Server != "s.whatsapp.net" {
+			return false, fmt.Sprintf("No phone-number JID is mapped for WhatsApp LID %s", recipientJID.String())
+		}
+		fmt.Printf("DEBUG: Resolved WhatsApp LID %s to phone JID %s\n", recipientJID.String(), pnJID.String())
+		recipientJID = pnJID
+	}
+
 	msg := &waProto.Message{}
 
 	// Check if we have media to send
@@ -529,8 +544,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	fmt.Printf("DEBUG: About to send message to JID: %s (Server: %s)\n", recipientJID.String(), recipientJID.Server)
 
-	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	// Bound the send operation so a stale LID/session cannot leave n8n waiting
+	// indefinitely for the MCP tool response.
+	sendCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = client.SendMessage(sendCtx, recipientJID, msg)
 
 	if err != nil {
 		fmt.Printf("DEBUG: SendMessage failed with error: %v\n", err)
