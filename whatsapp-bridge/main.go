@@ -362,6 +362,25 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+type lidPNResolver interface {
+	GetPNForLID(context.Context, types.JID) (types.JID, error)
+}
+
+func resolveRecipientJID(ctx context.Context, resolver lidPNResolver, recipientJID types.JID) (types.JID, error) {
+	if recipientJID.Server != types.HiddenUserServer {
+		return recipientJID, nil
+	}
+
+	pnJID, err := resolver.GetPNForLID(ctx, recipientJID.ToNonAD())
+	if err != nil {
+		return types.JID{}, fmt.Errorf("error resolving WhatsApp LID %s: %w", recipientJID.String(), err)
+	}
+	if pnJID.User == "" || pnJID.Server != types.DefaultUserServer {
+		return types.JID{}, fmt.Errorf("no phone-number JID is mapped for WhatsApp LID %s", recipientJID.String())
+	}
+	return pnJID, nil
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -393,6 +412,18 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 			Server: "s.whatsapp.net", // For personal chats
 		}
 		fmt.Printf("DEBUG: Created JID - User: %s, Server: %s\n", recipientJID.User, recipientJID.Server)
+	}
+
+	// WhatsApp may identify an incoming direct chat with an LID instead of a
+	// phone-number JID. Resolve it before sending; passing the LID directly can
+	// fail with "no LID found".
+	originalJID := recipientJID
+	recipientJID, err = resolveRecipientJID(context.Background(), client.Store.LIDs, recipientJID)
+	if err != nil {
+		return false, err.Error()
+	}
+	if originalJID.Server == types.HiddenUserServer {
+		fmt.Printf("DEBUG: Resolved WhatsApp LID %s to phone JID %s\n", originalJID.String(), recipientJID.String())
 	}
 
 	msg := &waProto.Message{}
@@ -529,8 +560,11 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 
 	fmt.Printf("DEBUG: About to send message to JID: %s (Server: %s)\n", recipientJID.String(), recipientJID.Server)
 
-	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	// Bound the send operation so a stale LID/session cannot leave n8n waiting
+	// indefinitely for the MCP tool response.
+	sendCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = client.SendMessage(sendCtx, recipientJID, msg)
 
 	if err != nil {
 		fmt.Printf("DEBUG: SendMessage failed with error: %v\n", err)
