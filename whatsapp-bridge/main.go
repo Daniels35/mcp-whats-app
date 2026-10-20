@@ -362,6 +362,25 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+type lidPNResolver interface {
+	GetPNForLID(context.Context, types.JID) (types.JID, error)
+}
+
+func resolveRecipientJID(ctx context.Context, resolver lidPNResolver, recipientJID types.JID) (types.JID, error) {
+	if recipientJID.Server != types.HiddenUserServer {
+		return recipientJID, nil
+	}
+
+	pnJID, err := resolver.GetPNForLID(ctx, recipientJID.ToNonAD())
+	if err != nil {
+		return types.JID{}, fmt.Errorf("error resolving WhatsApp LID %s: %w", recipientJID.String(), err)
+	}
+	if pnJID.User == "" || pnJID.Server != types.DefaultUserServer {
+		return types.JID{}, fmt.Errorf("no phone-number JID is mapped for WhatsApp LID %s", recipientJID.String())
+	}
+	return pnJID, nil
+}
+
 // Function to send a WhatsApp message
 func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
@@ -396,18 +415,15 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// WhatsApp may identify an incoming direct chat with an LID instead of a
-	// phone-number JID. Resolve that LID through whatsmeow's local mapping before
-	// sending; passing the LID directly can fail with "no LID found".
-	if recipientJID.Server == types.HiddenUserServer {
-		pnJID, resolveErr := client.Store.LIDs.GetPNForLID(context.Background(), recipientJID.ToNonAD())
-		if resolveErr != nil {
-			return false, fmt.Sprintf("Error resolving WhatsApp LID %s: %v", recipientJID.String(), resolveErr)
-		}
-		if pnJID.User == "" || pnJID.Server != "s.whatsapp.net" {
-			return false, fmt.Sprintf("No phone-number JID is mapped for WhatsApp LID %s", recipientJID.String())
-		}
-		fmt.Printf("DEBUG: Resolved WhatsApp LID %s to phone JID %s\n", recipientJID.String(), pnJID.String())
-		recipientJID = pnJID
+	// phone-number JID. Resolve it before sending; passing the LID directly can
+	// fail with "no LID found".
+	originalJID := recipientJID
+	recipientJID, err = resolveRecipientJID(context.Background(), client.Store.LIDs, recipientJID)
+	if err != nil {
+		return false, err.Error()
+	}
+	if originalJID.Server == types.HiddenUserServer {
+		fmt.Printf("DEBUG: Resolved WhatsApp LID %s to phone JID %s\n", originalJID.String(), recipientJID.String())
 	}
 
 	msg := &waProto.Message{}
